@@ -39,8 +39,8 @@ namespace Eve.TapToClick.Forms
         private const int PBT_APMSUSPEND = 0x0004;
         private const int GIDC_ARRIVAL = 1;
 
-        // 用于标识此程序注入的鼠标事件的 ExtraInfo 签名
-        private static readonly UIntPtr TAP_INPUT_EXTRA_INFO = (UIntPtr)0x544150; // "TAP"
+        // 修正为 IntPtr 匹配项目的 MouseInput.ExtraInfo 类型
+        private static readonly IntPtr TAP_INPUT_EXTRA_INFO = new IntPtr(0x544150); // "TAP"
 
         public MainForm()
         {
@@ -101,14 +101,16 @@ namespace Eve.TapToClick.Forms
         {
             try
             {
+                // 解决 CS0117 错误：用数值强制转换 RawInputDeviceFlags.DevNotify (0x00002000)
+                RawInputDeviceFlags flags = RawInputDeviceFlags.InputSink | (RawInputDeviceFlags)0x00002000;
+
                 User32.RegisterRawInputDevices(new RawInputDevice[]
                 {
                     new RawInputDevice
                     {
                         UsagePage = Constants.TargetDeviceUsage.UsagePage,
                         Usage = Constants.TargetDeviceUsage.Usage,
-                        // InputSink: 后台运行接收 | DevNotify: 监听硬件设备重新插拔/唤醒通知
-                        Flags = RawInputDeviceFlags.InputSink | RawInputDeviceFlags.DevNotify,
+                        Flags = flags,
                         WindowHandle = this.Handle
                     }
                 });
