@@ -28,6 +28,14 @@ namespace Eve.TapToClick.Forms
         private TapData currentTap;
         private TapData previousTap;
 
+        // Windows 消息及电源事件常量定义
+        private const int WM_POWERBROADCAST = 0x0218;
+        private const int WM_INPUT_DEVICE_CHANGE = 0x02FE;
+
+        private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+        private const int PBT_APMRESUMESUSPEND = 0x0007;
+        private const int GIDC_ARRIVAL = 1;
+
         public MainForm()
         {
             InitializeComponent();
@@ -58,21 +66,15 @@ namespace Eve.TapToClick.Forms
                 activeContactDisplay4,
                 activeContactDisplay5
             };
+
+            // 监听系统电源改变事件（系统级监听作为双重保障）
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
         }
 
         private void MainForm_Load(object sender, EventArgs e)
         {
             // Register to receive WM_INPUT messages for the specified HID device.
-            User32.RegisterRawInputDevices(new RawInputDevice[]
-            {
-                new RawInputDevice
-                {
-                    UsagePage = Constants.TargetDeviceUsage.UsagePage,
-                    Usage = Constants.TargetDeviceUsage.Usage,
-                    Flags = RawInputDeviceFlags.InputSink,
-                    WindowHandle = this.Handle
-                }
-            });
+            RegisterRawInput();
 
             // Load the config values into the text boxes
             LoadConfigValues();
@@ -85,6 +87,48 @@ namespace Eve.TapToClick.Forms
                 startupCheckbox.Checked = true;
 
             initialized = true;
+        }
+
+        /// <summary>
+        /// 注册/重新注册 Raw Input 设备
+        /// </summary>
+        private void RegisterRawInput()
+        {
+            try
+            {
+                User32.RegisterRawInputDevices(new RawInputDevice[]
+                {
+                    new RawInputDevice
+                    {
+                        UsagePage = Constants.TargetDeviceUsage.UsagePage,
+                        Usage = Constants.TargetDeviceUsage.Usage,
+                        // 加入 DevNotify 标记，允许接收设备连接/断开变更消息
+                        Flags = RawInputDeviceFlags.InputSink | RawInputDeviceFlags.DevNotify,
+                        WindowHandle = this.Handle
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to register raw input devices: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 清理休眠前的触控状态，防止恢复后产生无效点击
+        /// </summary>
+        private void ResetTouchState()
+        {
+            currentTap = null;
+        }
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Resume)
+            {
+                ResetTouchState();
+                RegisterRawInput();
+            }
         }
 
         private void MainForm_Shown(object sender, EventArgs e)
@@ -104,11 +148,37 @@ namespace Eve.TapToClick.Forms
             // We look for raw input messages here and pass them 
             // to the TouchpadWatcher, where they are processed into
             // the events below.
-            switch ((WindowMessage)m.Msg)
+            switch (m.Msg)
             {
-                case WindowMessage.WM_INPUT:
-                    touchpadWatcher.HandleInputMessage(ref m);
+                case (int)WindowMessage.WM_INPUT:
+                    try
+                    {
+                        touchpadWatcher.HandleInputMessage(ref m);
+                    }
+                    catch (Exception ex)
+                    {
+                        // 捕获可能出现的指针或句柄失效异常，防止程序崩溃
+                        System.Diagnostics.Debug.WriteLine($"Error handling raw input message: {ex.Message}");
+                        ResetTouchState();
+                    }
+                    break;
 
+                case WM_POWERBROADCAST:
+                    int wParamVal = m.WParam.ToInt32();
+                    // 当系统休眠唤醒（挂起恢复）时执行重新注册
+                    if (wParamVal == PBT_APMRESUMEAUTOMATIC || wParamVal == PBT_APMRESUMESUSPEND)
+                    {
+                        ResetTouchState();
+                        RegisterRawInput();
+                    }
+                    break;
+
+                case WM_INPUT_DEVICE_CHANGE:
+                    // 触摸板设备重新连接/重新初始化时自动绑定
+                    if (m.WParam.ToInt32() == GIDC_ARRIVAL)
+                    {
+                        RegisterRawInput();
+                    }
                     break;
             }
         }
@@ -412,6 +482,13 @@ namespace Eve.TapToClick.Forms
             {
                 AutoRun.AddStartupTask();
             }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            // 解绑电源事件监听
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            base.OnFormClosed(e);
         }
     }
 }
