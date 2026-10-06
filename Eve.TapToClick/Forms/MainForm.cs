@@ -10,8 +10,10 @@ using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.Linq;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Eve.TapToClick.Forms
@@ -28,36 +30,36 @@ namespace Eve.TapToClick.Forms
         private TapData currentTap;
         private TapData previousTap;
 
-        // Windows 消息及电源事件常量定义
+        // Win32 消息及电源/设备通知常量
         private const int WM_POWERBROADCAST = 0x0218;
         private const int WM_INPUT_DEVICE_CHANGE = 0x02FE;
 
         private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
         private const int PBT_APMRESUMESUSPEND = 0x0007;
+        private const int PBT_APMSUSPEND = 0x0004;
         private const int GIDC_ARRIVAL = 1;
+
+        // 用于标识此程序注入的鼠标事件的 ExtraInfo 签名
+        private static readonly UIntPtr TAP_INPUT_EXTRA_INFO = (UIntPtr)0x544150; // "TAP"
 
         public MainForm()
         {
             InitializeComponent();
 
-            // Load the config instance and store a ref
+            // 1. 加载配置单例
             config = AppConfiguration.Instance;
 
-            // Initialize TouchpadWatcher and hook into events
+            // 2. 初始化 TouchpadWatcher 并绑定事件
             touchpadWatcher = new TouchpadWatcher();
             touchpadWatcher.MinimumDetectionPressure = config.DetectionThreshold;
             touchpadWatcher.ContactStart += HandleContactStart;
             touchpadWatcher.ContactUpdate += HandleContactUpdate;
             touchpadWatcher.ContactEnd += HandleContactEnd;
 
-            // We keep track of when we last updated each
-            // contact display, so we can throttle UI updates
-            // while the mouse is moving. This keeps the program
-            // from using too much CPU
+            // 3. 初始化 UI 节流时间戳记录数组，节约高频触控下的 CPU 资源
             lastActiveContactUiUpdates = new DateTime?[Constants.MaxContacts];
 
-            // Create an array of the active contact displays
-            // for easy access later
+            // 4. UI 触控点显示控件映射
             activeContactDisplays = new ActiveContactDisplay[]
             {
                 activeContactDisplay1,
@@ -67,22 +69,25 @@ namespace Eve.TapToClick.Forms
                 activeContactDisplay5
             };
 
-            // 监听系统电源改变事件（系统级监听作为双重保障）
+            // 5. 注册系统电源模式改变通知（作为休眠唤醒的双重保障）
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
         }
 
         private void MainForm_Load(object sender, EventArgs e)
         {
-            // Register to receive WM_INPUT messages for the specified HID device.
+            // 检查管理员权限警告（解决 UIPI 导致在高权限窗口点击失效问题）
+            CheckAdminPrivileges();
+
+            // 注册 Raw Input 设备监听
             RegisterRawInput();
 
-            // Load the config values into the text boxes
+            // 加载配置参数到界面
             LoadConfigValues();
 
-            // Disable the apply button until a change is detected
+            // 禁用应用配置按钮直到检测到修改
             applyConfigButton.Enabled = false;
 
-            // Check if we're already set to auto-run on system startup
+            // 检查开机自启任务
             if (AutoRun.StartupTaskExists())
                 startupCheckbox.Checked = true;
 
@@ -90,7 +95,7 @@ namespace Eve.TapToClick.Forms
         }
 
         /// <summary>
-        /// 注册/重新注册 Raw Input 设备
+        /// 注册/重新注册 Raw Input 设备 (含 DevNotify 选项)
         /// </summary>
         private void RegisterRawInput()
         {
@@ -102,7 +107,7 @@ namespace Eve.TapToClick.Forms
                     {
                         UsagePage = Constants.TargetDeviceUsage.UsagePage,
                         Usage = Constants.TargetDeviceUsage.Usage,
-                        // 加入 DevNotify 标记，允许接收设备连接/断开变更消息
+                        // InputSink: 后台运行接收 | DevNotify: 监听硬件设备重新插拔/唤醒通知
                         Flags = RawInputDeviceFlags.InputSink | RawInputDeviceFlags.DevNotify,
                         WindowHandle = this.Handle
                     }
@@ -110,33 +115,66 @@ namespace Eve.TapToClick.Forms
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Failed to register raw input devices: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[RegisterRawInput Failed]: {ex.Message}");
             }
         }
 
         /// <summary>
-        /// 清理休眠前的触控状态，防止恢复后产生无效点击
+        /// 状态机重置：在睡眠、唤醒、设备变更或数据异常时清除残留在内存中的触控数据，防“假点击”
         /// </summary>
         private void ResetTouchState()
         {
             currentTap = null;
+
+            // 如果处于非最小化状态，清空界面活动触点控件状态
+            if (WindowState != FormWindowState.Minimized && activeContactDisplays != null)
+            {
+                for (int i = 0; i < activeContactDisplays.Length; i++)
+                {
+                    if (activeContactDisplays[i] != null)
+                    {
+                        activeContactDisplays[i].Active = false;
+                        activeContactDisplays[i].Pressure = 0;
+                        activeContactDisplays[i].X = 0;
+                        activeContactDisplays[i].Y = 0;
+                    }
+                    lastActiveContactUiUpdates[i] = null;
+                }
+            }
         }
 
         private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
         {
-            if (e.Mode == PowerModes.Resume)
+            switch (e.Mode)
             {
-                ResetTouchState();
-                RegisterRawInput();
+                case PowerModes.Suspend:
+                    // 系统准备睡眠时提前清空触控状态
+                    ResetTouchState();
+                    break;
+
+                case PowerModes.Resume:
+                    // 系统休眠唤醒后重置状态并强行重新注册设备句柄
+                    ResetTouchState();
+                    RegisterRawInput();
+                    break;
+            }
+        }
+
+        private void CheckAdminPrivileges()
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                WindowsPrincipal principal = new WindowsPrincipal(identity);
+                bool isAdmin = principal.IsInRole(WindowsBuiltInRole.Administrator);
+                if (!isAdmin)
+                {
+                    System.Diagnostics.Debug.WriteLine("[Warning]: Running without Administrator rights. UIPI may block simulated inputs on high-privilege windows.");
+                }
             }
         }
 
         private void MainForm_Shown(object sender, EventArgs e)
         {
-            // Should we start minimized?
-            // We do this in the "Shown" event handle, because
-            // the "Resize" event isn't fired when we do this
-            // inside the "Load" event handler.
             if (Environment.GetCommandLineArgs().Any(s => s.ToLower() == "--minimize"))
                 WindowState = FormWindowState.Minimized;
         }
@@ -145,9 +183,6 @@ namespace Eve.TapToClick.Forms
         {
             base.WndProc(ref m);
 
-            // We look for raw input messages here and pass them 
-            // to the TouchpadWatcher, where they are processed into
-            // the events below.
             switch (m.Msg)
             {
                 case (int)WindowMessage.WM_INPUT:
@@ -157,34 +192,36 @@ namespace Eve.TapToClick.Forms
                     }
                     catch (Exception ex)
                     {
-                        // 捕获可能出现的指针或句柄失效异常，防止程序崩溃
-                        System.Diagnostics.Debug.WriteLine($"Error handling raw input message: {ex.Message}");
+                        // 防护：防止休眠唤醒后非法的 LParam 引起指针越界引发全局崩溃
+                        System.Diagnostics.Debug.WriteLine($"[WM_INPUT Error]: {ex.Message}");
                         ResetTouchState();
                     }
                     break;
 
                 case WM_POWERBROADCAST:
-                    int wParamVal = m.WParam.ToInt32();
-                    // 当系统休眠唤醒（挂起恢复）时执行重新注册
-                    if (wParamVal == PBT_APMRESUMEAUTOMATIC || wParamVal == PBT_APMRESUMESUSPEND)
+                    int wp = m.WParam.ToInt32();
+                    if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)
                     {
                         ResetTouchState();
                         RegisterRawInput();
                     }
+                    else if (wp == PBT_APMSUSPEND)
+                    {
+                        ResetTouchState();
+                    }
                     break;
 
                 case WM_INPUT_DEVICE_CHANGE:
-                    // 触摸板设备重新连接/重新初始化时自动绑定
+                    // 硬件重新连接/重新初始化（唤醒枚举阶段）
                     if (m.WParam.ToInt32() == GIDC_ARRIVAL)
                     {
+                        ResetTouchState();
                         RegisterRawInput();
                     }
                     break;
             }
         }
 
-        // Originally, I thought I would need to handle these two types of events
-        // independently, but that didn't turn out to be the case.
         private void HandleContactStart(object sender, TouchpadEventArgs e)
         {
             ProcessActiveContact(e);
@@ -197,15 +234,19 @@ namespace Eve.TapToClick.Forms
 
         private void ProcessActiveContact(TouchpadEventArgs eventArgs)
         {
-            // If we're not inside an active 'tap', instantiate one.
+            // 防护：若长时间未结束（例如超过最大超时时间2倍），清除旧的“僵尸”Tap，防止状态卡死
+            if (currentTap != null && (DateTime.Now - currentTap.Start).TotalMilliseconds > config.MaxTapMilliseconds * 2)
+            {
+                currentTap = null;
+            }
+
+            // 如果当前不在活动 Tap 中，实例化新的 TapData
             if (currentTap == null)
                 currentTap = new TapData(Constants.MaxContacts);
 
             bool wasActive = currentTap.InstantaneousActiveContacts[eventArgs.ContactIndex];
             currentTap.InstantaneousActiveContacts[eventArgs.ContactIndex] = true;
 
-            // If we were previously active, add the distance from the last X/Y
-            // to this new one to the total distance in the tap object.
             if (wasActive)
             {
                 uint previousX = currentTap.PreviousXValues[eventArgs.ContactIndex];
@@ -215,7 +256,15 @@ namespace Eve.TapToClick.Forms
                 currentTap.TotalContactDistances[eventArgs.ContactIndex] += positionDelta;
             }
 
-            currentTap.MaximumActiveContacts = Math.Max(currentTap.InstantaneousActiveContacts.Count(ac => ac), currentTap.MaximumActiveContacts);
+            // 性能优化：替代 LINQ Count()，用简单的非堆分配循环统计活动触点
+            int activeCount = 0;
+            for (int i = 0; i < currentTap.InstantaneousActiveContacts.Length; i++)
+            {
+                if (currentTap.InstantaneousActiveContacts[i])
+                    activeCount++;
+            }
+
+            currentTap.MaximumActiveContacts = Math.Max(activeCount, currentTap.MaximumActiveContacts);
             currentTap.MaximumPressure = Math.Max(currentTap.MaximumPressure, eventArgs.Pressure);
 
             currentTap.PreviousXValues[eventArgs.ContactIndex] = eventArgs.X;
@@ -226,7 +275,7 @@ namespace Eve.TapToClick.Forms
                 currentTap.TapThresholdMet = true;
             }
 
-            // If we're not minimized, update the form values
+            // 如果未最小化，限流更新 UI (50ms 阀值)
             if (WindowState != FormWindowState.Minimized &&
                 (!lastActiveContactUiUpdates[eventArgs.ContactIndex].HasValue || (DateTime.Now - lastActiveContactUiUpdates[eventArgs.ContactIndex].Value).TotalMilliseconds >= 50))
             {
@@ -243,52 +292,54 @@ namespace Eve.TapToClick.Forms
 
         private void HandleContactEnd(object sender, TouchpadEventArgs e)
         {
-            // If the tap object is null, just bail out
             if (currentTap == null)
                 return;
 
             currentTap.InstantaneousActiveContacts[e.ContactIndex] = false;
-            int currentActiveContacts = currentTap.InstantaneousActiveContacts.Count(ac => ac);
 
-            // Has the tap ended?
+            // 性能优化：无 GC 内存开销的活动触点计数
+            int currentActiveContacts = 0;
+            for (int i = 0; i < currentTap.InstantaneousActiveContacts.Length; i++)
+            {
+                if (currentTap.InstantaneousActiveContacts[i])
+                    currentActiveContacts++;
+            }
+
+            // 所有触点均抬起，Tap 动作结束
             if (currentActiveContacts == 0)
             {
                 DateTime tapEnd = DateTime.Now;
 
-                // Okay, was this *really* a tap?
-                // We need to validate by checking the total duration, whether the pressure threshold was met,
-                // and if the distance was within the maximum range.
+                // 验证该操作是否符合 Tap 标准（时间、压力、位移）
                 if ((tapEnd - currentTap.Start).TotalMilliseconds <= config.MaxTapMilliseconds &&
                     currentTap.TapThresholdMet &&
                     currentTap.TotalContactDistances.Max() <= config.MaxTapDeltaPosition)
                 {
-                    // If it was a single-finger tap, inject a left click.
-                    if (currentTap.MaximumActiveContacts == 1)
+                    int maxContacts = currentTap.MaximumActiveContacts;
+
+                    // 异步派发 SendInput 注入点击，不阻塞 Raw Input 接收与 UI 线程
+                    ThreadPool.QueueUserWorkItem(_ =>
                     {
-                        SendLeftClick();
-                    }
-                    // If it was a double-finger tap, inject a right click.
-                    else if (currentTap.MaximumActiveContacts == 2)
-                    {
-                        SendRightClick();
-                    }
-                    else if (currentTap.MaximumActiveContacts == 3)
-                    {
-                        SendMiddleClick();
-                    }
+                        if (maxContacts == 1)
+                        {
+                            SendLeftClick();
+                        }
+                        else if (maxContacts == 2)
+                        {
+                            SendRightClick();
+                        }
+                        else if (maxContacts == 3)
+                        {
+                            SendMiddleClick();
+                        }
+                    });
                 }
 
-                // Store reference to previous tap. Will probably need this later
-                // if we want to add in support for double-tap-and-drag.
                 previousTap = currentTap;
-
-                // Clear out current tap, for it is over and done
                 currentTap = null;
 
-                // If we're not minimized, update form values
                 if (WindowState != FormWindowState.Minimized)
                 {
-                    // Update previous tap display
                     previousMaxPressureLabel.Text = previousTap.MaximumPressure.ToString();
                     previousDurationLabel.Text = ((int)(tapEnd - previousTap.Start).TotalMilliseconds).ToString();
                     previousMaxDistanceLabel.Text = ((int)previousTap.TotalContactDistances.Max()).ToString();
@@ -322,80 +373,92 @@ namespace Eve.TapToClick.Forms
 
         private void SendLeftClick()
         {
-            User32.SendInput(new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
+            User32.SendInput(
+                new Input
                 {
-                    MouseInput = new MouseInput
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
                     {
-                        Flags = MouseInputFlag.LeftDown
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.LeftDown,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
+                    }
+                },
+                new Input
+                {
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
+                    {
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.LeftUp,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
                     }
                 }
-            },
-            new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
-                {
-                    MouseInput = new MouseInput
-                    {
-                        Flags = MouseInputFlag.LeftUp
-                    }
-                }
-            });
+            );
         }
 
         private void SendRightClick()
         {
-            User32.SendInput(new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
+            User32.SendInput(
+                new Input
                 {
-                    MouseInput = new MouseInput
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
                     {
-                        Flags = MouseInputFlag.RightDown
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.RightDown,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
+                    }
+                },
+                new Input
+                {
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
+                    {
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.RightUp,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
                     }
                 }
-            },
-            new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
-                {
-                    MouseInput = new MouseInput
-                    {
-                        Flags = MouseInputFlag.RightUp
-                    }
-                }
-            });
+            );
         }
 
         private void SendMiddleClick()
         {
-            User32.SendInput(new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
+            User32.SendInput(
+                new Input
                 {
-                    MouseInput = new MouseInput
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
                     {
-                        Flags = MouseInputFlag.MiddleDown
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.MiddleDown,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
+                    }
+                },
+                new Input
+                {
+                    Type = InputType.Mouse,
+                    InputValue = new Input.InputUnion
+                    {
+                        MouseInput = new MouseInput
+                        {
+                            Flags = MouseInputFlag.MiddleUp,
+                            ExtraInfo = TAP_INPUT_EXTRA_INFO
+                        }
                     }
                 }
-            },
-            new Input
-            {
-                Type = InputType.Mouse,
-                InputValue = new Input.InputUnion
-                {
-                    MouseInput = new MouseInput
-                    {
-                        Flags = MouseInputFlag.MiddleUp
-                    }
-                }
-            });
+            );
         }
 
         private void SaveConfigValues()
@@ -469,15 +532,11 @@ namespace Eve.TapToClick.Forms
 
         private void startupCheckbox_CheckedChanged(object sender, EventArgs e)
         {
-            // If the form isn't done loading, ignore change events.
             if (!initialized)
                 return;
 
             AutoRun.RemoveStartupTask();
 
-            // If we're checked, add the task.
-            // Just a note: we use task scheduler here as opposed to the "Startup" folder
-            // or the registry, because those solutions will cause UAC prompt on startup.
             if (startupCheckbox.Checked)
             {
                 AutoRun.AddStartupTask();
@@ -486,7 +545,7 @@ namespace Eve.TapToClick.Forms
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            // 解绑电源事件监听
+            // 注销系统电源变化监听，防止内存泄露
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             base.OnFormClosed(e);
         }
