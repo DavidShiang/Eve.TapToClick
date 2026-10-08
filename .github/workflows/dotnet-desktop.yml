@@ -44,16 +44,20 @@ jobs:
       with:
         name: Eve.TapToClick-Executable
         path: Eve.TapToClick.zip
-
+    
     - name: Create GitHub Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          Eve.TapToClick.zip
-          Eve.TapToClick/bin/Release/Eve.TapToClick.exe
-        draft: false
-        prerelease: false
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 只要是推送 Tag 或者 手工触发（workflow_dispatch），就创建 Release
+          if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+          uses: softprops/action-gh-release@v2
+          with:
+            # 手工触发时，若没有 tag，自动使用自定义的名字/当前分支作为发布标识
+            tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('manual-{0}', github.run_number) }}
+            name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Manual Build #{0}', github.run_number) }}
+            files: |
+              Eve.TapToClick.zip
+              Eve.TapToClick/bin/Release/Eve.TapToClick.exe
+            draft: false
+            prerelease: false
+            generate_release_notes: true
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
