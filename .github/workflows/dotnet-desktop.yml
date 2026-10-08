@@ -31,7 +31,7 @@ jobs:
       run: |
         New-Item -ItemType Directory -Force -Path "./release-artifacts"
         Copy-Item -Path "Eve.TapToClick\bin\Release\*" -Destination "./release-artifacts" -Recurse -Force
-        Compress-Archive -Path "./release-artifacts\*" -DestinationPath "Eve.TapToClick.zip"
+        Compress-Archive -Path "./release-artifacts\*" -DestinationPath "Eve.TapToClick.zip" -Force
 
     - name: Upload Artifact to Workflow
       uses: actions/upload-artifact@v4
